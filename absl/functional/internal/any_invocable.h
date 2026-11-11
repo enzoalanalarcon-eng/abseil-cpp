@@ -53,6 +53,7 @@
 
 // IWYU pragma: private, include "absl/functional/any_invocable.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstring>
@@ -172,12 +173,29 @@ enum class FunctionToCall : unsigned char {
 // The portion of `AnyInvocable` state that contains either a pointer to the
 // target object or the object itself in local storage
 union TypeErasedState {
+  // `std::atomic` is not copyable and (in C++20) not trivially default-
+  // constructible, which would otherwise delete `TypeErasedState`'s implicit
+  // special member functions.
+  TypeErasedState() noexcept {}
+  TypeErasedState(const TypeErasedState& other) noexcept {
+    std::memcpy(storage, other.storage, sizeof(storage));
+  }
+  TypeErasedState& operator=(const TypeErasedState& other) noexcept {
+    std::memmove(storage, other.storage, sizeof(storage));
+    return *this;
+  }
+
   struct {
     // A pointer to the type-erased object when remotely stored
     void* target;
     // The size of the object for `RemoteManagerTrivial`
     std::size_t size;
   } remote;
+
+  // Pointer-sized words for `CopyStateWords` and `InitializeStorage`.
+  // Relaxed atomic word accesses prevent SLP vectorization into a 16-byte
+  // vector load/store.
+  std::atomic<std::size_t> words[kStorageSize / sizeof(std::size_t)];
 
   // Local-storage for the type-erased object when small and trivial enough
   alignas(kAlignment) unsigned char storage[kStorageSize];
@@ -209,15 +227,29 @@ inline void EmptyManager(FunctionToCall /*operation*/,
                          TypeErasedState* /*from*/,
                          TypeErasedState* /*to*/) noexcept {}
 
+// Copies `TypeErasedState` as two pointer-sized words rather than a single
+// 2-word vector load/store so that moving an `AnyInvocable` immediately after
+// initializing it with scalar pointer/integer stores does not suffer a
+// partial store-to-load forwarding stall.
+inline void CopyStateWords(const TypeErasedState* const from,
+                           TypeErasedState* const to) noexcept {
+  static_assert(kStorageSize == 2 * sizeof(std::size_t));
+  static_assert(sizeof(TypeErasedState) == kStorageSize);
+  const std::size_t w0 = from->words[0].load(std::memory_order_relaxed);
+  const std::size_t w1 = from->words[1].load(std::memory_order_relaxed);
+  to->words[0].store(w0, std::memory_order_relaxed);
+  to->words[1].store(w1, std::memory_order_relaxed);
+}
+
 // The manager that is used when a target function is in local storage and is
 // a trivially copyable type.
 inline void LocalManagerTrivial(FunctionToCall /*operation*/,
                                 TypeErasedState* const from,
                                 TypeErasedState* const to) noexcept {
-  // This single statement without branching handles both possible operations.
+  // This single operation without branching handles both possible operations.
   //
   // For FunctionToCall::dispose, "from" and "to" point to the same state, and
-  // so this assignment logically would do nothing.
+  // so this copy logically would do nothing.
   //
   // Note: Correctness here relies on http://wg21.link/p0593, which has only
   // become standard in C++20, though implementations do not break it in
@@ -227,7 +259,7 @@ inline void LocalManagerTrivial(FunctionToCall /*operation*/,
   // default-constructed T in "to->storage" prior to the memmove, but doing so
   // requires a different function to be created for each T that is stored
   // locally, which can cause unnecessary bloat and be less cache friendly.
-  *to = *from;
+  CopyStateWords(from, to);
 
   // Note: Because the type is trivially copyable, the destructor does not need
   // to be called ("trivially copyable" requires a trivial destructor).
@@ -285,7 +317,7 @@ inline void RemoteManagerTrivial(FunctionToCall operation,
     case FunctionToCall::relocate_from_to:
     case FunctionToCall::relocate_from_to_and_query_rust:
       // NOTE: Requires that the left-hand operand is already empty.
-      to->remote = from->remote;
+      CopyStateWords(from, to);
       return;
     case FunctionToCall::dispose:
 #if defined(__cpp_sized_deallocation)
@@ -510,13 +542,32 @@ class CoreImpl {
   void InitializeStorage(Args&&... args) {
     using RawT = RemoveCVRef<QualTRef>;
     if constexpr (IsStoredLocally<RawT>()) {
-      ::new (static_cast<void*>(&state_.storage))
-          RawT(std::forward<Args>(args)...);
       invoker_ = LocalInvoker<SigIsNoexcept, ReturnType, QualTRef, P...>;
       // We can simplify our manager if we know the type is trivially copyable.
       if constexpr (std::is_trivially_copyable_v<RawT>) {
+        // Stage non-empty trivially copyable callables into full pointer-sized
+        // words so narrow sub-word stores do not stall the word-sized loads in
+        // `LocalManagerTrivial`.
+        if constexpr (std::is_empty_v<RawT>) {
+          ::new (static_cast<void*>(&state_.storage))
+              RawT(std::forward<Args>(args)...);
+        } else {
+          TypeErasedState buf;
+          std::memset(buf.storage, 0, sizeof(buf.storage));
+          ::new (static_cast<void*>(&buf.storage))
+              RawT(std::forward<Args>(args)...);
+          if constexpr (sizeof(RawT) <= sizeof(std::size_t)) {
+            state_.words[0].store(
+                buf.words[0].load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+          } else {
+            CopyStateWords(&buf, &state_);
+          }
+        }
         manager_ = LocalManagerTrivial;
       } else {
+        ::new (static_cast<void*>(&state_.storage))
+            RawT(std::forward<Args>(args)...);
         manager_ = LocalManagerNontrivial<RawT>;
       }
     } else {
