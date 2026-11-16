@@ -1070,6 +1070,7 @@ absl_cc_test(
     absl::random_random
     absl::synchronization
     absl::type_traits
+    GTest::gmock
     GTest::gtest_main
 )
 

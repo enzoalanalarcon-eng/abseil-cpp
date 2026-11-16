@@ -22,6 +22,7 @@
 #include <limits>
 #include <ostream>
 #include <type_traits>
+#include <utility>
 
 #include "absl/base/config.h"
 #include "absl/meta/type_traits.h"
@@ -72,8 +73,15 @@ class pcg_engine {
 
   explicit pcg_engine(uint64_t seed_value = 0) { seed(seed_value); }
 
-  template <class SeedSequence, typename = typename std::enable_if_t<
-                                    !std::is_same_v<SeedSequence, pcg_engine>>>
+  template <
+      class SeedSequence,
+      typename = std::enable_if_t<
+          !std::is_same_v<absl::remove_cvref_t<SeedSequence>, pcg_engine> &&
+          !std::is_convertible_v<SeedSequence, uint64_t>>,
+      typename = std::void_t<
+          decltype(std::declval<std::remove_reference_t<SeedSequence>&>()
+                       .generate(std::declval<uint32_t*>(),
+                                 std::declval<uint32_t*>()))>>
   explicit pcg_engine(SeedSequence&& seq) {
     seed(seq);
   }
@@ -95,8 +103,13 @@ class pcg_engine {
   }
 
   template <class SeedSequence>
-  typename std::enable_if_t<!std::is_convertible_v<SeedSequence, uint64_t>,
-                            void>
+  std::enable_if_t<
+      !std::is_same_v<absl::remove_cvref_t<SeedSequence>, pcg_engine> &&
+          !std::is_convertible_v<SeedSequence, uint64_t>,
+      std::void_t<
+          decltype(std::declval<std::remove_reference_t<SeedSequence>&>()
+                       .generate(std::declval<uint32_t*>(),
+                                 std::declval<uint32_t*>()))>>
   seed(SeedSequence&& seq) {
     reseed(seq);
   }
@@ -206,15 +219,13 @@ class pcg_engine {
 
   template <class SeedSequence>
   void reseed(SeedSequence& seq) {
-    using sequence_result_type = typename SeedSequence::result_type;
-    constexpr size_t kBufferSize =
-        sizeof(state_type) / sizeof(sequence_result_type);
-    sequence_result_type buffer[kBufferSize];
+    constexpr size_t kBufferSize = sizeof(state_type) / sizeof(uint32_t);
+    uint32_t buffer[kBufferSize];
     seq.generate(std::begin(buffer), std::end(buffer));
     // Convert the seed output to a single state value.
     state_type tmp = buffer[0];
     for (size_t i = 1; i < kBufferSize; i++) {
-      tmp <<= (sizeof(sequence_result_type) * 8);
+      tmp <<= (sizeof(uint32_t) * 8);
       tmp |= buffer[i];
     }
     state_ = lcg(tmp + params_type::increment());

@@ -16,8 +16,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <iterator>
+#include <optional>
 #include <random>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -103,7 +106,7 @@ TEST(SaltedSeedSeq, SaltedSaltedSeedSeqIsNotDoubleSalted) {
   uint32_t a[16];
   salted_seq.generate(std::begin(a), std::end(a));
 
-  // The second salting.
+  // The second salting (rvalue).
   SaltedSeedSeq<std::seed_seq> salted_salted_seq =
       MakeSaltedSeedSeq(std::move(salted_seq));
   uint32_t b[16];
@@ -111,6 +114,106 @@ TEST(SaltedSeedSeq, SaltedSaltedSeedSeqIsNotDoubleSalted) {
 
   // ... both should be equal.
   EXPECT_THAT(b, Pointwise(Eq(), a)) << "a[0] " << a[0];
+
+  // Lvalue SaltedSeedSeq must also not be double-salted.
+  auto lvalue_salted_seq = MakeSaltedSeedSeq(salted_salted_seq);
+  uint32_t c[16];
+  lvalue_salted_seq.generate(std::begin(c), std::end(c));
+  EXPECT_THAT(c, Pointwise(Eq(), a));
+
+  // Const lvalue and const rvalue SaltedSeedSeq must also not be double-salted.
+  const SaltedSeedSeq<std::seed_seq> const_salted_seq(std::begin(init),
+                                                      std::end(init));
+  auto from_const_lvalue = MakeSaltedSeedSeq(const_salted_seq);
+  uint32_t e[16];
+  from_const_lvalue.generate(std::begin(e), std::end(e));
+  EXPECT_THAT(e, Pointwise(Eq(), a));
+
+  auto from_const_rvalue = MakeSaltedSeedSeq(std::move(const_salted_seq));
+  uint32_t f[16];
+  from_const_rvalue.generate(std::begin(f), std::end(f));
+  EXPECT_THAT(f, Pointwise(Eq(), a));
+}
+
+TEST(SaltedSeedSeq, BraceMoveInvokesMoveConstructor) {
+  SaltedSeedSeq<std::seed_seq> expected_seq{1, 3, 5, 7, 9};
+  uint32_t expected[16];
+  expected_seq.generate(std::begin(expected), std::end(expected));
+
+  SaltedSeedSeq<std::seed_seq> source{1, 3, 5, 7, 9};
+  SaltedSeedSeq<std::seed_seq> brace_moved{std::move(source)};
+  uint32_t actual[16];
+  brace_moved.generate(std::begin(actual), std::end(actual));
+  EXPECT_THAT(actual, Pointwise(Eq(), expected));
+}
+
+TEST(SaltedSeedSeq, MakeSaltedSeedSeqReturnsOwningFromNonOwningRef) {
+  uint32_t init[] = {1, 3, 5, 7, 9};
+  SaltedSeedSeq<std::seed_seq> expected_seq(std::begin(init), std::end(init));
+  uint32_t expected[16];
+  expected_seq.generate(std::begin(expected), std::end(expected));
+
+  std::optional<SaltedSeedSeq<std::seed_seq>> owned_from_mutable;
+  std::optional<SaltedSeedSeq<std::seed_seq>> owned_from_const;
+  {
+    std::seed_seq raw(std::begin(init), std::end(init));
+    auto made_mutable = MakeSaltedSeedSeq(SaltedSeedSeq<std::seed_seq&>(raw));
+    static_assert(
+        std::is_same_v<decltype(made_mutable), SaltedSeedSeq<std::seed_seq>>);
+    owned_from_mutable.emplace(std::move(made_mutable));
+
+    const std::seed_seq const_raw(std::begin(init), std::end(init));
+    auto made_const =
+        MakeSaltedSeedSeq(SaltedSeedSeq<const std::seed_seq&>(const_raw));
+    static_assert(
+        std::is_same_v<decltype(made_const), SaltedSeedSeq<std::seed_seq>>);
+    owned_from_const.emplace(std::move(made_const));
+  }
+
+  uint32_t from_mutable[16];
+  owned_from_mutable->generate(std::begin(from_mutable),
+                               std::end(from_mutable));
+  EXPECT_THAT(from_mutable, Pointwise(Eq(), expected));
+
+  uint32_t from_const[16];
+  owned_from_const->generate(std::begin(from_const), std::end(from_const));
+  EXPECT_THAT(from_const, Pointwise(Eq(), expected));
+}
+
+TEST(SaltedSeedSeq, ConstructorConstraints) {
+  static_assert(std::is_constructible_v<SaltedSeedSeq<std::seed_seq>,
+                                        std::initializer_list<int>>);
+  static_assert(std::is_constructible_v<SaltedSeedSeq<std::seed_seq>,
+                                        std::initializer_list<uint32_t>>);
+  static_assert(std::is_constructible_v<SaltedSeedSeq<std::seed_seq>,
+                                        std::initializer_list<uint64_t>>);
+  static_assert(!std::is_constructible_v<SaltedSeedSeq<std::seed_seq>,
+                                         std::initializer_list<double>>);
+  static_assert(!std::is_constructible_v<SaltedSeedSeq<std::seed_seq>,
+                                         std::initializer_list<const char*>>);
+  static_assert(std::is_constructible_v<SaltedSeedSeq<std::seed_seq>, uint32_t*,
+                                        uint32_t*>);
+  static_assert(
+      !std::is_constructible_v<SaltedSeedSeq<std::seed_seq>, double*, double*>);
+  static_assert(
+      !std::is_constructible_v<SaltedSeedSeq<std::seed_seq>, double, double>);
+  static_assert(
+      !std::is_constructible_v<SaltedSeedSeq<std::seed_seq>, void*, void*>);
+
+  static_assert(
+      !std::is_default_constructible_v<SaltedSeedSeq<std::seed_seq&>>);
+  static_assert(!std::is_constructible_v<SaltedSeedSeq<std::seed_seq&>,
+                                         std::initializer_list<uint32_t>>);
+  static_assert(!std::is_constructible_v<SaltedSeedSeq<std::seed_seq&>,
+                                         uint32_t*, uint32_t*>);
+  static_assert(
+      std::is_constructible_v<SaltedSeedSeq<std::seed_seq&>, std::seed_seq&>);
+
+  SaltedSeedSeq<std::seed_seq> from_u32{1u, 2u, 3u};
+  EXPECT_EQ(from_u32.size(), 3u);
+
+  SaltedSeedSeq<std::seed_seq> from_u64{uint64_t{1}, uint64_t{2}};
+  EXPECT_EQ(from_u64.size(), 2u);
 }
 
 TEST(SaltedSeedSeq, SeedMaterialIsSalted) {

@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -63,7 +64,7 @@ class RandenPoolSeedSeq {
  public:
   using result_type = uint32_t;
 
-  size_t size() { return 0; }
+  size_t size() const { return 0; }
 
   template <typename OutIterator>
   void param(OutIterator) const {}
@@ -89,6 +90,90 @@ class RandenPoolSeedSeq {
   }
 };
 
+// Detects whether `T` is a valid `[rand.req.seedseq]` `result_type`
+// (an unqualified unsigned integer type of at least 32 bits).
+template <typename T, typename = void>
+struct IsValidSeedSeqResultType : std::false_type {};
+
+template <typename T>
+struct IsValidSeedSeqResultType<
+    T, std::enable_if_t<std::is_same_v<T, absl::remove_cvref_t<T>> &&
+                        std::is_integral_v<T> && std::is_unsigned_v<T>>>
+    : std::bool_constant<(std::numeric_limits<T>::digits >= 32)> {};
+
+// Detects whether `std::remove_reference_t<SSeq>` has a valid `result_type`
+// and supports `seq.generate(uint32_t*, uint32_t*)` on an lvalue (preserving
+// `const`).
+template <typename SSeq, typename = void>
+struct HasSeedSeqGenerate : std::false_type {};
+
+template <typename SSeq>
+struct HasSeedSeqGenerate<
+    SSeq,
+    std::enable_if_t<
+        IsValidSeedSeqResultType<
+            typename std::remove_reference_t<SSeq>::result_type>::value,
+        std::void_t<
+            decltype(std::declval<std::remove_reference_t<SSeq>&>().generate(
+                std::declval<uint32_t*>(), std::declval<uint32_t*>()))>>>
+    : std::true_type {};
+
+// Detects whether `URBG` can be constructed directly from `seq` (if it is
+// already a `SaltedSeedSeq`) or from a stack-scoped non-owning
+// `SaltedSeedSeq<std::remove_reference_t<SSeq>&>`.
+template <typename URBG, typename SSeq, typename = void>
+struct CanDirectlySeedURBG : std::false_type {};
+
+template <typename URBG, typename SSeq>
+struct CanDirectlySeedURBG<URBG, SSeq,
+                           std::enable_if_t<HasSeedSeqGenerate<SSeq>::value>>
+    : std::is_constructible<
+          URBG,
+          std::conditional_t<is_salted_seed_seq<SSeq>::value,
+                             std::remove_reference_t<SSeq>&,
+                             SaltedSeedSeq<std::remove_reference_t<SSeq>&>&>> {
+};
+
+template <typename SSeq, typename ResultType, typename = void>
+struct HasSeedSeqParam : std::false_type {};
+
+template <typename SSeq, typename ResultType>
+struct HasSeedSeqParam<
+    SSeq, ResultType,
+    std::void_t<decltype(std::declval<std::remove_reference_t<SSeq>&>().param(
+        std::back_inserter(
+            std::declval<absl::InlinedVector<ResultType, 8>&>())))>>
+    : std::true_type {};
+
+template <typename URBG, typename SSeq, typename Target, typename ResultType,
+          typename = void>
+struct CanMakeSaltedSeedSeqImpl : std::false_type {};
+
+template <typename URBG, typename SSeq, typename Target, typename ResultType>
+struct CanMakeSaltedSeedSeqImpl<
+    URBG, SSeq, Target, ResultType,
+    std::enable_if_t<std::conjunction_v<
+        std::is_constructible<
+            SaltedSeedSeq<Target>,
+            typename absl::InlinedVector<ResultType, 8>::iterator,
+            typename absl::InlinedVector<ResultType, 8>::iterator>,
+        HasSeedSeqParam<SSeq, ResultType>>>>
+    : std::is_constructible<URBG, SaltedSeedSeq<Target>&> {};
+
+// Detects whether `MakeSaltedSeedSeq(seq)` can construct a mutable owning
+// `SaltedSeedSeq` from `seq` via `seq.param(...)` (e.g. `const std::seed_seq&`
+// or `const absl::SeedSeq&`) that can construct `URBG`.
+template <typename URBG, typename SSeq, typename = void>
+struct CanMakeSaltedSeedSeq : std::false_type {};
+
+template <typename URBG, typename SSeq>
+struct CanMakeSaltedSeedSeq<URBG, SSeq,
+                            std::enable_if_t<HasSeedSeqGenerate<
+                                typename UnwrappedSeedSeq<SSeq>::type>::value>>
+    : CanMakeSaltedSeedSeqImpl<
+          URBG, SSeq, typename UnwrappedSeedSeq<SSeq>::type,
+          typename UnwrappedSeedSeq<SSeq>::type::result_type> {};
+
 // Each instance of NonsecureURBGBase<URBG> will be seeded by variates produced
 // by a thread-unique URBG-instance.
 template <typename URBG, typename Seeder = RandenPoolSeedSeq>
@@ -106,8 +191,14 @@ class NonsecureURBGBase {
   NonsecureURBGBase& operator=(NonsecureURBGBase&&) = default;
 
   // Constructor using a seed
-  template <class SSeq, typename = typename std::enable_if_t<
-                            !std::is_same_v<SSeq, NonsecureURBGBase>>>
+  template <
+      class SSeq,
+      typename = std::enable_if_t<
+          !std::is_same_v<absl::remove_cvref_t<SSeq>, NonsecureURBGBase> &&
+          !std::is_base_of_v<NonsecureURBGBase, absl::remove_cvref_t<SSeq>> &&
+          !std::is_convertible_v<SSeq, result_type>>,
+      typename = std::enable_if_t<std::disjunction_v<
+          CanDirectlySeedURBG<URBG, SSeq>, CanMakeSaltedSeedSeq<URBG, SSeq>>>>
   explicit NonsecureURBGBase(SSeq&& seq)
       : urbg_(ConstructURBG(std::forward<SSeq>(seq))) {}
 
@@ -145,9 +236,17 @@ class NonsecureURBGBase {
 
   template <typename SSeq>
   static URBG ConstructURBG(SSeq&& seq) {  // NOLINT(runtime/references)
-    auto salted_seq =
-        random_internal::MakeSaltedSeedSeq(std::forward<SSeq>(seq));
-    return URBG(salted_seq);
+    if constexpr (CanDirectlySeedURBG<URBG, SSeq>::value) {
+      if constexpr (is_salted_seed_seq<SSeq>::value) {
+        return URBG(seq);
+      } else {
+        SaltedSeedSeq<std::remove_reference_t<SSeq>&> salted_seq(seq);
+        return URBG(salted_seq);
+      }
+    } else {
+      auto salted_seq = random_internal::MakeSaltedSeedSeq(seq);
+      return URBG(salted_seq);
+    }
   }
 
   URBG urbg_;

@@ -15,6 +15,8 @@
 #ifndef ABSL_RANDOM_INTERNAL_SALTED_SEED_SEQ_H_
 #define ABSL_RANDOM_INTERNAL_SALTED_SEED_SEQ_H_
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
@@ -36,6 +38,20 @@ namespace absl {
 ABSL_NAMESPACE_BEGIN
 namespace random_internal {
 
+template <typename Iterator, bool IsPointer = std::is_pointer_v<Iterator>,
+          typename = void>
+struct IsIntegralIterator : std::false_type {};
+
+template <typename Iterator>
+struct IsIntegralIterator<Iterator, true, void>
+    : std::is_integral<std::remove_pointer_t<Iterator>> {};
+
+template <typename Iterator>
+struct IsIntegralIterator<
+    Iterator, false,
+    std::void_t<typename std::iterator_traits<Iterator>::value_type>>
+    : std::is_integral<typename std::iterator_traits<Iterator>::value_type> {};
+
 // This class conforms to the C++ Standard "Seed Sequence" concept
 // [rand.req.seedseq].
 //
@@ -46,19 +62,37 @@ namespace random_internal {
 // not modified.
 template <typename SSeq>
 class SaltedSeedSeq {
+  using raw_sequence_type = std::remove_reference_t<SSeq>;
+
  public:
   using inner_sequence_type = SSeq;
-  using result_type = typename SSeq::result_type;
+  using result_type = typename raw_sequence_type::result_type;
 
-  SaltedSeedSeq() : seq_(std::make_unique<SSeq>()) {}
+  template <typename U = SSeq,
+            typename = std::enable_if_t<std::conjunction_v<
+                std::negation<std::is_lvalue_reference<U>>,
+                std::is_default_constructible<std::remove_reference_t<U>>>>>
+  SaltedSeedSeq() : seq_(std::make_unique<raw_sequence_type>()) {}
 
-  template <typename Iterator>
+  template <typename Iterator, typename U = SSeq,
+            typename = std::enable_if_t<std::conjunction_v<
+                std::negation<std::is_lvalue_reference<U>>,
+                IsIntegralIterator<Iterator>,
+                std::is_constructible<raw_sequence_type, Iterator, Iterator>>>>
   SaltedSeedSeq(Iterator begin, Iterator end)
-      : seq_(std::make_unique<SSeq>(begin, end)) {}
+      : seq_(std::make_unique<raw_sequence_type>(begin, end)) {}
 
-  template <typename T>
+  template <
+      typename T, typename U = SSeq,
+      typename = std::enable_if_t<std::conjunction_v<
+          std::negation<std::is_lvalue_reference<U>>, std::is_integral<T>,
+          std::is_constructible<raw_sequence_type, std::initializer_list<T>>>>>
   SaltedSeedSeq(std::initializer_list<T> il)
-      : SaltedSeedSeq(il.begin(), il.end()) {}
+      : seq_(std::make_unique<raw_sequence_type>(il)) {}
+
+  template <typename U = SSeq,
+            typename = std::enable_if_t<std::is_lvalue_reference_v<U>>>
+  explicit SaltedSeedSeq(raw_sequence_type& seq) : seq_(&seq) {}
 
   SaltedSeedSeq(const SaltedSeedSeq&) = delete;
   SaltedSeedSeq& operator=(const SaltedSeedSeq&) = delete;
@@ -66,30 +100,39 @@ class SaltedSeedSeq {
   SaltedSeedSeq(SaltedSeedSeq&&) = default;
   SaltedSeedSeq& operator=(SaltedSeedSeq&&) = default;
 
-  template <typename RandomAccessIterator>
+  template <typename RandomAccessIterator, typename U = raw_sequence_type,
+            typename = std::void_t<decltype(std::declval<U&>().generate(
+                std::declval<uint32_t*>(), std::declval<uint32_t*>()))>>
   void generate(RandomAccessIterator begin, RandomAccessIterator end) {
-    using U = typename std::iterator_traits<RandomAccessIterator>::value_type;
+    using V = typename std::iterator_traits<RandomAccessIterator>::value_type;
 
     // The common case is that generate is called with ContiguousIterators
     // to uint arrays. Such contiguous memory regions may be optimized,
     // which we detect here.
     using TagType = std::conditional_t<
-        (std::is_same_v<U, uint32_t> &&
+        (std::is_same_v<V, uint32_t> &&
          (std::is_pointer_v<RandomAccessIterator> ||
           std::is_same_v<RandomAccessIterator,
-                         typename std::vector<U>::iterator>)),
+                         typename std::vector<V>::iterator>)),
         ContiguousAndUint32Tag, DefaultTag>;
     if (begin != end) {
       generate_impl(TagType{}, begin, end, std::distance(begin, end));
     }
   }
 
-  template <typename OutIterator>
+  template <typename OutIterator, typename U = raw_sequence_type,
+            typename = std::void_t<decltype(std::declval<U&>().param(
+                std::declval<OutIterator>()))>>
   void param(OutIterator out) const {
     seq_->param(out);
   }
 
-  size_t size() const { return seq_->size(); }
+  template <typename U = raw_sequence_type,
+            typename = std::enable_if_t<std::is_convertible_v<
+                decltype(std::declval<U&>().size()), size_t>>>
+  size_t size() const {
+    return seq_->size();
+  }
 
  private:
   struct ContiguousAndUint32Tag {};
@@ -97,14 +140,16 @@ class SaltedSeedSeq {
 
   // Generate which requires the iterators are contiguous pointers to uint32_t.
   // Fills the initial seed buffer the underlying SSeq::generate() call,
-  // then mixes in the salt material.
+  // then mixes in the salt material if available.
   template <typename Contiguous>
   void generate_impl(ContiguousAndUint32Tag, Contiguous begin, Contiguous end,
                      size_t n) {
     seq_->generate(begin, end);
-    const uint32_t salt = absl::random_internal::GetSaltMaterial().value_or(0);
-    auto span = absl::Span<uint32_t>(&*begin, n);
-    MixIntoSeedMaterial(absl::MakeConstSpan(&salt, 1), span);
+    const auto salt = absl::random_internal::GetSaltMaterial();
+    if (salt.has_value()) {
+      auto span = absl::Span<uint32_t>(&*begin, n);
+      MixIntoSeedMaterial(absl::MakeConstSpan(&*salt, 1), span);
+    }
   }
 
   // The uncommon case for generate is that it is called with iterators over
@@ -122,42 +167,63 @@ class SaltedSeedSeq {
   }
 
   // Because [rand.req.seedseq] is not required to be copy-constructible,
-  // copy-assignable nor movable, we wrap it with unique pointer to be able
-  // to move SaltedSeedSeq.
-  std::unique_ptr<SSeq> seq_;
+  // copy-assignable nor movable, owning instances wrap it with unique_ptr to be
+  // movable, while SaltedSeedSeq<SSeq&> holds a non-owning pointer.
+  std::conditional_t<std::is_lvalue_reference_v<SSeq>, raw_sequence_type*,
+                     std::unique_ptr<raw_sequence_type>>
+      seq_;
 };
 
-// is_salted_seed_seq indicates whether the type is a SaltedSeedSeq.
+// is_salted_seed_seq indicates whether the type (ignoring cvref) is a
+// SaltedSeedSeq.
 template <typename T, typename = void>
 struct is_salted_seed_seq : public std::false_type {};
 
 template <typename T>
 struct is_salted_seed_seq<
-    T, std::enable_if_t<
-           std::is_same_v<T, SaltedSeedSeq<typename T::inner_sequence_type>>>>
+    T,
+    std::enable_if_t<std::is_same_v<
+        absl::remove_cvref_t<T>,
+        SaltedSeedSeq<typename absl::remove_cvref_t<T>::inner_sequence_type>>>>
     : public std::true_type {};
 
+// UnwrappedSeedSeq unwraps `SaltedSeedSeq<Inner>` to
+// `absl::remove_cvref_t<Inner>`, or decays any other seed sequence type via
+// `absl::remove_cvref_t`.
+template <typename SSeq, bool = is_salted_seed_seq<SSeq>::value>
+struct UnwrappedSeedSeq {
+  using type = absl::remove_cvref_t<SSeq>;
+};
+
+template <typename SSeq>
+struct UnwrappedSeedSeq<SSeq, true> {
+  using type = absl::remove_cvref_t<
+      typename absl::remove_cvref_t<SSeq>::inner_sequence_type>;
+};
+
+template <typename SSeq>
+struct is_movable_owning_salted_seed_seq : std::false_type {};
+
+template <typename Inner>
+struct is_movable_owning_salted_seed_seq<SaltedSeedSeq<Inner>>
+    : std::negation<std::is_lvalue_reference<Inner>> {};
+
 // MakeSaltedSeedSeq returns a salted variant of the seed sequence.
-// When provided with an existing SaltedSeedSeq, returns the input parameter,
+// When provided with an existing SaltedSeedSeq, preserves single salting,
 // otherwise constructs a new SaltedSeedSeq which embodies the original
 // non-salted seed parameters.
-template <
-    typename SSeq,  //
-    typename EnableIf = std::enable_if_t<is_salted_seed_seq<SSeq>::value>>
-SSeq MakeSaltedSeedSeq(SSeq&& seq) {
-  return SSeq(std::forward<SSeq>(seq));
-}
+template <typename SSeq>
+auto MakeSaltedSeedSeq(SSeq&& seq) {
+  if constexpr (is_movable_owning_salted_seed_seq<SSeq>::value) {
+    return SSeq(std::forward<SSeq>(seq));
+  } else {
+    using target_type = typename UnwrappedSeedSeq<SSeq>::type;
+    using result_type = typename target_type::result_type;
 
-template <
-    typename SSeq,  //
-    typename EnableIf = std::enable_if_t<!is_salted_seed_seq<SSeq>::value>>
-SaltedSeedSeq<std::decay_t<SSeq>> MakeSaltedSeedSeq(SSeq&& seq) {
-  using sseq_type = std::decay_t<SSeq>;
-  using result_type = typename sseq_type::result_type;
-
-  absl::InlinedVector<result_type, 8> data;
-  seq.param(std::back_inserter(data));
-  return SaltedSeedSeq<sseq_type>(data.begin(), data.end());
+    absl::InlinedVector<result_type, 8> data;
+    seq.param(std::back_inserter(data));
+    return SaltedSeedSeq<target_type>(data.begin(), data.end());
+  }
 }
 
 }  // namespace random_internal

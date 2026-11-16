@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,7 @@
 #include <limits>
 #include <ostream>
 #include <type_traits>
+#include <utility>
 
 #include "absl/base/config.h"
 #include "absl/base/internal/endian.h"
@@ -65,9 +67,19 @@ class alignas(8) randen_engine {
   randen_engine() : randen_engine(0) {}
   explicit randen_engine(result_type seed_value) { seed(seed_value); }
 
-  template <class SeedSequence,
-            typename = typename std::enable_if_t<
-                !std::is_same_v<SeedSequence, randen_engine>>>
+  template <
+      class SeedSequence,
+      typename = std::enable_if_t<
+          !std::is_same_v<absl::remove_cvref_t<SeedSequence>, randen_engine> &&
+          !std::is_convertible_v<SeedSequence, result_type>>,
+      typename = std::enable_if_t<std::is_convertible_v<
+          decltype(std::declval<std::remove_reference_t<SeedSequence>&>()
+                       .size()),
+          size_t>>,
+      typename = std::void_t<
+          decltype(std::declval<std::remove_reference_t<SeedSequence>&>()
+                       .generate(std::declval<uint32_t*>(),
+                                 std::declval<uint32_t*>()))>>
   explicit randen_engine(SeedSequence&& seq) {
     seed(seq);
   }
@@ -95,9 +107,20 @@ class alignas(8) randen_engine {
     return little_endian::ToHost(begin[next_++]);
   }
 
-  template <class SeedSequence>
-  typename std::enable_if_t<!std::is_convertible_v<SeedSequence, result_type>>
-  seed(SeedSequence&& seq) {
+  template <
+      class SeedSequence,
+      typename = std::enable_if_t<
+          !std::is_same_v<absl::remove_cvref_t<SeedSequence>, randen_engine> &&
+          !std::is_convertible_v<SeedSequence, result_type>>,
+      typename = std::enable_if_t<std::is_convertible_v<
+          decltype(std::declval<std::remove_reference_t<SeedSequence>&>()
+                       .size()),
+          size_t>>,
+      typename = std::void_t<
+          decltype(std::declval<std::remove_reference_t<SeedSequence>&>()
+                       .generate(std::declval<uint32_t*>(),
+                                 std::declval<uint32_t*>()))>>
+  void seed(SeedSequence&& seq) {
     // Zeroes the state.
     seed();
     reseed(seq);
@@ -117,12 +140,8 @@ class alignas(8) randen_engine {
   // future outputs even if state is compromised).
   template <class SeedSequence>
   void reseed(SeedSequence& seq) {
-    using sequence_result_type = typename SeedSequence::result_type;
-    static_assert(sizeof(sequence_result_type) == 4,
-                  "SeedSequence::result_type must be 32-bit");
-    constexpr size_t kBufferSize =
-        Randen::kSeedBytes / sizeof(sequence_result_type);
-    alignas(16) sequence_result_type buffer[kBufferSize];
+    constexpr size_t kBufferSize = Randen::kSeedBytes / sizeof(uint32_t);
+    alignas(16) uint32_t buffer[kBufferSize];
 
     // Randen::Absorb XORs the seed into state, which is then mixed by a call
     // to Randen::Generate. Seeding with only the provided entropy is preferred
@@ -138,7 +157,7 @@ class alignas(8) randen_engine {
 #ifdef ABSL_IS_BIG_ENDIAN
       // Randen expects the seed buffer to be in Little Endian; reverse it on
       // Big Endian platforms.
-      for (sequence_result_type& e : buffer) {
+      for (uint32_t& e : buffer) {
         e = absl::little_endian::FromHost(e);
       }
 #endif

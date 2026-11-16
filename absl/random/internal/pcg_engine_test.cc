@@ -233,6 +233,20 @@ TYPED_TEST(PCGEngineTest, RandomNumberEngineInterface) {
                 "return type of operator== must be bool");
 }
 
+TYPED_TEST(PCGEngineTest, NonConstCopyConstruction) {
+  using E = TypeParam;
+  E v(123);
+  v();
+
+  E copy_paren(v);
+  E copy_brace{v};
+  EXPECT_TRUE(copy_paren == v);
+  EXPECT_TRUE(copy_brace == v);
+  const auto expected = v();
+  EXPECT_EQ(copy_paren(), expected);
+  EXPECT_EQ(copy_brace(), expected);
+}
+
 TYPED_TEST(PCGEngineTest, RandenEngineSFINAETest) {
   using engine_type = TypeParam;
   using result_type = typename engine_type::result_type;
@@ -269,6 +283,90 @@ TYPED_TEST(PCGEngineTest, RandenEngineSFINAETest) {
     engine_type engine{std::seed_seq()};
     engine.seed(std::seed_seq());
   }
+}
+
+template <typename Engine, typename Arg, typename = void>
+struct HasSeedMethod : std::false_type {};
+
+template <typename Engine, typename Arg>
+struct HasSeedMethod<
+    Engine, Arg,
+    std::void_t<decltype(std::declval<Engine&>().seed(std::declval<Arg>()))>>
+    : std::true_type {};
+
+template <typename ResultT, bool kConstGenerate = true, uint32_t kStart = 1>
+struct TestSeedSeq {
+  using result_type = ResultT;
+  size_t size() const { return 4; }
+  template <typename OutIt, bool C = kConstGenerate,
+            std::enable_if_t<C, int> = 0>
+  void generate(OutIt begin, OutIt end) const {
+    uint32_t v = kStart;
+    for (OutIt it = begin; it != end; ++it) *it = v++;
+  }
+  template <typename OutIt, bool C = kConstGenerate,
+            std::enable_if_t<!C, int> = 0>
+  void generate(OutIt begin, OutIt end) {
+    uint32_t v = kStart;
+    for (OutIt it = begin; it != end; ++it) *it = v++;
+  }
+};
+
+using NonConstGenerateSeedSeq = TestSeedSeq<uint32_t, /*kConstGenerate=*/false>;
+using ConstGenerateSeedSeq = TestSeedSeq<uint32_t>;
+using SeedSeq64 = TestSeedSeq<uint64_t, /*kConstGenerate=*/false, 0xdeadbeefu>;
+using SeedSeq32 = TestSeedSeq<uint32_t, /*kConstGenerate=*/false, 0xdeadbeefu>;
+
+TYPED_TEST(PCGEngineTest, SeedSequenceConstraintsAndConstSeeding) {
+  using engine_type = TypeParam;
+
+  const ConstGenerateSeedSeq const_seq;
+  engine_type engine(const_seq);
+  engine_type reseeded;
+  reseeded.seed(const_seq);
+  EXPECT_TRUE(engine == reseeded);
+
+  static_assert(!std::is_constructible_v<engine_type, int*>);
+  static_assert(!std::is_constructible_v<engine_type, void*>);
+  static_assert(!HasSeedMethod<engine_type, int*>::value);
+  static_assert(!HasSeedMethod<engine_type, void*>::value);
+
+  static_assert(std::is_constructible_v<engine_type, std::seed_seq&>);
+  static_assert(std::is_constructible_v<engine_type, std::seed_seq&&>);
+  static_assert(HasSeedMethod<engine_type, std::seed_seq&>::value);
+  static_assert(HasSeedMethod<engine_type, std::seed_seq&&>::value);
+
+  // Test non-const generate() rejection with a dedicated type because MSVC STL
+  // marks std::seed_seq::generate() const while libc++/libstdc++ do not.
+  static_assert(std::is_constructible_v<engine_type, NonConstGenerateSeedSeq&>);
+  static_assert(
+      std::is_constructible_v<engine_type, NonConstGenerateSeedSeq&&>);
+  static_assert(
+      !std::is_constructible_v<engine_type, const NonConstGenerateSeedSeq&>);
+  static_assert(
+      !std::is_constructible_v<engine_type, const NonConstGenerateSeedSeq&&>);
+  static_assert(HasSeedMethod<engine_type, NonConstGenerateSeedSeq&>::value);
+  static_assert(
+      !HasSeedMethod<engine_type, const NonConstGenerateSeedSeq&>::value);
+
+  static_assert(
+      std::is_constructible_v<engine_type, const ConstGenerateSeedSeq&>);
+  static_assert(HasSeedMethod<engine_type, const ConstGenerateSeedSeq&>::value);
+}
+
+TYPED_TEST(PCGEngineTest, SeedSequenceWith64BitResultTypeMatches32Bit) {
+  using engine_type = TypeParam;
+  SeedSeq64 seq64;
+  SeedSeq32 seq32;
+  engine_type e64(seq64);
+  engine_type e32(seq32);
+  EXPECT_TRUE(e64 == e32);
+  EXPECT_EQ(e64(), e32());
+
+  e64.seed(seq64);
+  e32.seed(seq32);
+  EXPECT_TRUE(e64 == e32);
+  EXPECT_EQ(e64(), e32());
 }
 
 // ------------------------------------------------------------------
